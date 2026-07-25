@@ -25,6 +25,14 @@ let truncated = ale.game_truncated()?;
 let screen = ale.screen()?; // borrowed, 210 * 160 palette indices
 ```
 
+Three screen views are available, all borrowed from reused buffers so a steady
+render loop allocates nothing: `screen()` (palette indices), `screen_grayscale()`
+(one byte per pixel), and `screen_rgb()` (three bytes per pixel — the same bytes
+`ale_py`'s `render()` returns in `rgb_array` mode). `get_int` / `get_float` read
+a setting back out of the live interface, so a caller can verify what it
+configured instead of trusting its own record; like the setters, they work
+before a ROM is loaded.
+
 ## Building
 
 ALE is a C++ library you build separately. Point `ALE_ROOT` at a CMake install

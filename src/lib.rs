@@ -54,6 +54,16 @@ mod ffi {
         ) -> c_int;
         pub fn ale_shim_set_int(shim: *mut c_void, key: *const c_char, value: c_int) -> c_int;
         pub fn ale_shim_set_float(shim: *mut c_void, key: *const c_char, value: c_float) -> c_int;
+        pub fn ale_shim_get_int(
+            shim: *mut c_void,
+            key: *const c_char,
+            out_value: *mut c_int,
+        ) -> c_int;
+        pub fn ale_shim_get_float(
+            shim: *mut c_void,
+            key: *const c_char,
+            out_value: *mut c_float,
+        ) -> c_int;
         pub fn ale_shim_load_rom(shim: *mut c_void, path: *const c_char) -> c_int;
         pub fn ale_shim_reset_game(shim: *mut c_void) -> c_int;
         pub fn ale_shim_act(
@@ -83,6 +93,7 @@ mod ffi {
             out_width: *mut usize,
         ) -> *const u8;
         pub fn ale_shim_screen_grayscale(shim: *mut c_void, out_len: *mut usize) -> *const u8;
+        pub fn ale_shim_screen_rgb(shim: *mut c_void, out_len: *mut usize) -> *const u8;
         pub fn ale_shim_version() -> *const c_char;
         pub fn ale_shim_set_logger_mode(mode: c_int);
     }
@@ -119,6 +130,20 @@ mod ffi {
             _shim: *mut c_void,
             _key: *const c_char,
             _value: c_float,
+        ) -> c_int {
+            unreachable!("{UNLINKED}")
+        }
+        pub unsafe fn ale_shim_get_int(
+            _shim: *mut c_void,
+            _key: *const c_char,
+            _out_value: *mut c_int,
+        ) -> c_int {
+            unreachable!("{UNLINKED}")
+        }
+        pub unsafe fn ale_shim_get_float(
+            _shim: *mut c_void,
+            _key: *const c_char,
+            _out_value: *mut c_float,
         ) -> c_int {
             unreachable!("{UNLINKED}")
         }
@@ -418,6 +443,35 @@ impl Ale {
         })
     }
 
+    /// Read an integer setting back out of the live interface.
+    ///
+    /// Deliberately available before [`Self::load_rom`], with no
+    /// [`AleError::NoRomLoaded`] guard: `ALEInterface::getInt` reads the
+    /// `Settings` object the constructor builds
+    /// (`src/ale/ale_interface.cpp:199`), not the null-until-`loadROM`
+    /// `environment` every accessor below dereferences. Same reason
+    /// [`Self::set_int`] has no guard.
+    pub fn get_int(&mut self, key: &str) -> Result<i32, AleError> {
+        let key = c_string(key, "setting key")?;
+        self.scalar(|handle, out| {
+            // SAFETY: as `set_int`; `out` is a live, aligned `c_int`.
+            unsafe { ffi::ale_shim_get_int(handle, key.as_ptr(), out) }
+        })
+    }
+
+    /// Read a float setting back out of the live interface.
+    ///
+    /// As [`Self::get_int`], including the absence of a ROM guard.
+    pub fn get_float(&mut self, key: &str) -> Result<f32, AleError> {
+        let key = c_string(key, "setting key")?;
+        let mut value = 0.0;
+        self.checked(|handle| {
+            // SAFETY: as `get_int`.
+            unsafe { ffi::ale_shim_get_float(handle, key.as_ptr(), &raw mut value) }
+        })?;
+        Ok(value)
+    }
+
     /// Whether ALE recognizes the file at `path` as a supported cartridge.
     ///
     /// `Ok(name)` gives ALE's canonical ROM name. Errors cover a missing file,
@@ -655,6 +709,38 @@ impl Ale {
         }
     }
 
+    /// Borrow the RGB screen ALE produces for `obs_type="rgb"` and for
+    /// `render_mode="rgb_array"`.
+    ///
+    /// Three bytes per pixel, row-major, so the slice is `3 * height * width`
+    /// long. These are the exact bytes `ale_py`'s `AtariEnv.render()` returns in
+    /// `rgb_array` mode — `env.py` calls `getScreenRGB` and applies no further
+    /// transform. As with [`Self::screen_grayscale`] the buffer belongs to this
+    /// instance and is reused, so only the first call allocates; it is a
+    /// *separate* buffer from the grayscale one, so the two do not invalidate
+    /// each other.
+    pub fn screen_rgb(&mut self) -> Result<&[u8], AleError> {
+        self.require_rom()?;
+        #[cfg(ale_linked)]
+        {
+            let mut len = 0usize;
+            // SAFETY: `len` is a live local; the returned pointer is checked.
+            let pixels = unsafe { ffi::ale_shim_screen_rgb(self.handle, &raw mut len) };
+            if pixels.is_null() {
+                return Err(self.last_error());
+            }
+            // SAFETY: the shim resized its own `std::vector` to exactly `len`
+            // bytes and returned `data()`. The `&mut self` borrow keeps the
+            // next call to this function — the only thing that rewrites that
+            // buffer — from overlapping this slice.
+            Ok(unsafe { std::slice::from_raw_parts(pixels, len) })
+        }
+        #[cfg(not(ale_linked))]
+        {
+            Err(AleError::NotLinked)
+        }
+    }
+
     #[cfg(ale_linked)]
     fn last_error(&self) -> AleError {
         // SAFETY: `ale_shim_last_error` never returns null for a live handle
@@ -792,6 +878,20 @@ mod tests {
         };
         assert!(height > 0 && width > 0);
         assert_eq!(ale.screen_grayscale().unwrap().len(), pixel_count);
+        // RGB is the same screen at three bytes per pixel, and it must not be
+        // uniform — a palette that failed to apply would return all zeros and
+        // still have the right length.
+        let rgb = ale.screen_rgb().unwrap().to_vec();
+        assert_eq!(rgb.len(), pixel_count * 3);
+        assert!(
+            rgb.iter().any(|&byte| byte != rgb[0]),
+            "an RGB frame of one repeated byte means the palette did not apply"
+        );
+        // Separate buffers: taking the grayscale frame in between must not
+        // disturb what the RGB path returns.
+        let grayscale = ale.screen_grayscale().unwrap().to_vec();
+        assert_eq!(ale.screen_rgb().unwrap(), rgb);
+        assert_eq!(ale.screen_grayscale().unwrap(), grayscale);
         ale.lives().unwrap();
         assert!(!ale.game_truncated().unwrap(), "no frame cap was set");
         assert!(ale.frame_number().unwrap() > 0, "acting emulated a frame");
@@ -819,6 +919,34 @@ mod tests {
         assert_eq!(ale.minimal_action_set().unwrap_err(), AleError::NoRomLoaded);
         assert_eq!(ale.screen().unwrap_err(), AleError::NoRomLoaded);
         assert_eq!(ale.screen_grayscale().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.screen_rgb().unwrap_err(), AleError::NoRomLoaded);
+    }
+
+    /// The setting getters are the deliberate exception to the rule above: they
+    /// read the constructor-built `Settings`, never `environment`, so they work
+    /// before a ROM is loaded and must keep doing so — that is what lets a
+    /// caller verify its configuration at construction time.
+    #[test]
+    fn settings_round_trip_without_a_loaded_rom() {
+        let Ok(mut ale) = Ale::new() else {
+            return;
+        };
+        // ALE's own defaults (emucore/Settings.cxx), read before anything is
+        // written, so this fails if the getters silently return zero.
+        assert_eq!(ale.get_int("max_num_frames_per_episode").unwrap(), 0);
+        assert_eq!(ale.get_float("repeat_action_probability").unwrap(), 0.25);
+
+        ale.set_int("max_num_frames_per_episode", 108_000).unwrap();
+        ale.set_float("repeat_action_probability", 0.0).unwrap();
+        assert_eq!(ale.get_int("max_num_frames_per_episode").unwrap(), 108_000);
+        assert_eq!(ale.get_float("repeat_action_probability").unwrap(), 0.0);
+
+        // A key with an embedded NUL cannot become a C string and is rejected
+        // here rather than truncated on the way down.
+        assert!(matches!(
+            ale.get_int("bad\0key").unwrap_err(),
+            AleError::InteriorNul(_)
+        ));
     }
 
     /// `ALEState::apply_action`'s `default:` arm is `std::exit(-1)`; 18 is the

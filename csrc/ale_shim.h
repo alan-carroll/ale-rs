@@ -50,6 +50,15 @@ int ale_shim_supported_rom(AleShim *shim, const char *path, char *out,
 
 int ale_shim_set_int(AleShim *shim, const char *key, int value);
 int ale_shim_set_float(AleShim *shim, const char *key, float value);
+
+/* Read a setting back out of the live interface, so a caller can verify what it
+ * configured rather than trusting its own record of it. Settings live in an
+ * ALEInterface-owned Settings object built by the constructor, so — like the
+ * two setters above and unlike every accessor below — these need no loaded ROM.
+ * Writes through the out parameter; the return value is the status code. */
+int ale_shim_get_int(AleShim *shim, const char *key, int *out_value);
+int ale_shim_get_float(AleShim *shim, const char *key, float *out_value);
+
 int ale_shim_load_rom(AleShim *shim, const char *path);
 int ale_shim_reset_game(AleShim *shim);
 
@@ -81,6 +90,13 @@ const uint8_t *ale_shim_screen(AleShim *shim, size_t *out_height,
  * same handle. NULL on failure. The buffer is reused across calls, so steady
  * state allocates nothing. */
 const uint8_t *ale_shim_screen_grayscale(AleShim *shim, size_t *out_len);
+
+/* As ale_shim_screen_grayscale, but the RGB palette: three bytes per pixel,
+ * row-major, so out_len is 3 * height * width. This is the exact buffer
+ * ale_py's render() returns in rgb_array mode (env.py calls getScreenRGB and
+ * applies no further transform). Its own reused handle-owned buffer, so it does
+ * not disturb the grayscale one. */
+const uint8_t *ale_shim_screen_rgb(AleShim *shim, size_t *out_len);
 
 /* Compiled-in ALE_VERSION of the linked library. */
 const char *ale_shim_version(void);

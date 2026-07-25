@@ -23,6 +23,9 @@ struct AleShim {
   /* Reused across calls so the grayscale path allocates only on the first
    * frame; ALE's applyPaletteGrayscale resizes, which is a no-op afterwards. */
   std::vector<unsigned char> grayscale;
+  /* The RGB twin of `grayscale`, kept separate so a caller holding one borrow
+   * cannot have it rewritten by a call for the other palette. */
+  std::vector<unsigned char> rgb;
   std::string last_error;
 };
 
@@ -95,6 +98,24 @@ int ale_shim_set_int(AleShim *shim, const char *key, int value) {
 
 int ale_shim_set_float(AleShim *shim, const char *key, float value) {
   return guard(shim, [&] { shim->ale.setFloat(key, value); });
+}
+
+int ale_shim_get_int(AleShim *shim, const char *key, int *out_value) {
+  return guard(shim, [&] {
+    const int value = shim->ale.getInt(key);
+    if (out_value != nullptr) {
+      *out_value = value;
+    }
+  });
+}
+
+int ale_shim_get_float(AleShim *shim, const char *key, float *out_value) {
+  return guard(shim, [&] {
+    const float value = shim->ale.getFloat(key);
+    if (out_value != nullptr) {
+      *out_value = value;
+    }
+  });
 }
 
 int ale_shim_load_rom(AleShim *shim, const char *path) {
@@ -200,6 +221,18 @@ const uint8_t *ale_shim_screen_grayscale(AleShim *shim, size_t *out_len) {
       *out_len = shim->grayscale.size();
     }
     pixels = shim->grayscale.data();
+  });
+  return status == ALE_SHIM_OK ? pixels : nullptr;
+}
+
+const uint8_t *ale_shim_screen_rgb(AleShim *shim, size_t *out_len) {
+  const uint8_t *pixels = nullptr;
+  const int status = guard(shim, [&] {
+    shim->ale.getScreenRGB(shim->rgb);
+    if (out_len != nullptr) {
+      *out_len = shim->rgb.size();
+    }
+    pixels = shim->rgb.data();
   });
   return status == ALE_SHIM_OK ? pixels : nullptr;
 }
