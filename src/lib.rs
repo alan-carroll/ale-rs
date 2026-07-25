@@ -314,9 +314,12 @@ pub struct Ale {
 // free-standing [`set_logger_mode`] and never per instance.
 //
 // That scan is indicative, not exhaustive, so this justification is *tested*
-// rather than merely asserted: the consuming test suite steps N instances
-// round-robin in one process and requires byte-identical streams against the
-// same N run in isolation.
+// rather than merely asserted. Two properties, and they are not the same one,
+// so the consuming suite carries two receipts: instances sharing one address
+// space must not interfere (N stepped round-robin on one thread equal the same
+// N run alone), and the transfer this `impl` actually licenses must be safe
+// (N built and stepped on N threads, plus one built on one thread and moved to
+// another to be stepped there, all matching the single-threaded streams).
 //
 // Deliberately no `Sync`: `&Ale` would permit concurrent `screen()` reads
 // against ALE's own mutable buffer.
@@ -658,7 +661,14 @@ impl Ale {
         // and the string is valid until the next call on this handle, which
         // cannot happen while `&self` is borrowed here.
         let message = unsafe { CStr::from_ptr(ffi::ale_shim_last_error(self.handle)) };
-        AleError::Ale(message.to_string_lossy().into_owned())
+        let message = message.to_string_lossy();
+        if message.is_empty() {
+            // `guard` clears the slot on entry, so an accessor that failed by
+            // returning null without throwing would otherwise surface as an
+            // error with no text at all.
+            return AleError::Ale("ALE reported a failure with no message".to_string());
+        }
+        AleError::Ale(message.into_owned())
     }
 
     #[cfg(ale_linked)]

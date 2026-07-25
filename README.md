@@ -88,10 +88,15 @@ Stella then fails to create still exits.
 `Ale` is `Send` but not `Sync` and not `Clone`. The `unsafe impl Send` is
 justified by single-owner semantics — ALE holds its emulator state in
 per-instance `unique_ptr`s — and the one process-global observed, the logger
-mode, is reachable only through the free-standing `set_logger_mode`. That
-justification is worth testing rather than trusting: step N instances
-round-robin in one process and check the streams against the same N run in
-isolation.
+mode, is reachable only through the free-standing `set_logger_mode`.
+
+That justification is worth testing rather than trusting, and it takes two
+tests because it is two properties. For *interference*, step N instances
+round-robin on one thread and compare against the same N run alone. For
+*transfer* — what `Send` actually licenses — build and step N instances on N
+threads, and move one across a thread boundary before stepping it. Round-robin
+on a single thread does not exercise transfer, and a caller that spawns an
+evaluation thread per environment exercises both.
 
 Constructing the first `Ale` in a process quiets ALE's logger to `Error` unless
 `set_logger_mode` was called first, because `ALEInterface`'s constructor prints
