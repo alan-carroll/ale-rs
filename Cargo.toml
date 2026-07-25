@@ -1,0 +1,21 @@
+[package]
+name = "ale-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-2.0-only"
+description = "Minimal in-process Rust binding for the Arcade Learning Environment's C++ ALEInterface"
+repository = "https://github.com/alan-carroll/ale-rs"
+readme = "README.md"
+links = "ale"
+build = "build.rs"
+# The C sources are the crate; nothing else is published.
+include = ["src/**", "csrc/**", "build.rs", "README.md", "LICENSE"]
+
+# Deliberately dependency-free, including build-dependencies: build.rs drives
+# the host C++ compiler directly rather than pulling `cc`. Consumers of this
+# crate inherit exactly one thing — a link line.
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ale_linked)'] }
