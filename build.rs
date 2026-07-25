@@ -29,6 +29,13 @@ fn main() {
         return;
     };
 
+    // Cargo does not fingerprint external libraries, so without this a rebuild
+    // of ALE in place at the same ALE_ROOT would keep linking the old bits.
+    println!(
+        "cargo::rerun-if-changed={}",
+        root.join("lib/libale.a").display()
+    );
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let object = out_dir.join("ale_shim.o");
     let archive = out_dir.join("libale_shim.a");

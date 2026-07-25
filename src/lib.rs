@@ -253,6 +253,14 @@ pub enum AleError {
     /// Rejected in Rust because ALE's `ALEState::apply_action` ends its switch
     /// with `std::exit(-1)`, so letting one through would kill the process.
     ActionOutOfRange(i32),
+    /// A method that needs a loaded ROM was called before [`Ale::load_rom`]
+    /// succeeded.
+    ///
+    /// Rejected in Rust because `ALEInterface` holds its `environment` as a
+    /// null `unique_ptr` until `loadROM` runs, and every post-ROM method
+    /// dereferences it unconditionally — a segfault, not an exception, so the
+    /// shim's guard cannot catch it.
+    NoRomLoaded,
     /// The C++ side threw; this is `what()`, or a generic message for a
     /// non-`std::exception` throw.
     Ale(String),
@@ -272,6 +280,7 @@ impl fmt::Display for AleError {
                 f,
                 "ALE action value {action} is outside the PLAYER_A range 0..=17"
             ),
+            Self::NoRomLoaded => write!(f, "no ROM is loaded (call load_rom first)"),
             Self::Ale(message) => write!(f, "ALE error: {message}"),
         }
     }
@@ -287,6 +296,10 @@ impl std::error::Error for AleError {}
 pub struct Ale {
     #[cfg_attr(not(ale_linked), allow(dead_code))]
     handle: *mut c_void,
+    /// Set once [`Ale::load_rom`] succeeds, and never cleared: ALE's
+    /// `environment` member stays valid from then on, even if a later load
+    /// fails. Every method that would dereference it checks this first.
+    rom_loaded: bool,
 }
 
 // SAFETY: `Ale` owns its `AleShim` exclusively — the field is private, the type
@@ -362,7 +375,10 @@ impl Ale {
             if handle.is_null() {
                 return Err(AleError::ConstructionFailed);
             }
-            Ok(Self { handle })
+            Ok(Self {
+                handle,
+                rom_loaded: false,
+            })
         }
         #[cfg(not(ale_linked))]
         {
@@ -444,11 +460,26 @@ impl Ale {
         self.checked(|handle| {
             // SAFETY: as `set_int`.
             unsafe { ffi::ale_shim_load_rom(handle, path.as_ptr()) }
-        })
+        })?;
+        self.rom_loaded = true;
+        Ok(())
+    }
+
+    /// The guard in front of ALE's third unrecoverable path: until `loadROM`
+    /// runs, `ALEInterface::environment` is a null `unique_ptr` that every
+    /// post-ROM method dereferences — a segfault the shim's exception guard
+    /// cannot catch. Rejected here instead.
+    fn require_rom(&self) -> Result<(), AleError> {
+        if self.rom_loaded {
+            Ok(())
+        } else {
+            Err(AleError::NoRomLoaded)
+        }
     }
 
     /// Start a new episode.
     pub fn reset_game(&mut self) -> Result<(), AleError> {
+        self.require_rom()?;
         // SAFETY: as `set_int`.
         self.checked(|handle| unsafe { ffi::ale_shim_reset_game(handle) })
     }
@@ -473,6 +504,7 @@ impl Ale {
         if !(0..=17).contains(&action) {
             return Err(AleError::ActionOutOfRange(action));
         }
+        self.require_rom()?;
         let mut reward = 0;
         // SAFETY: `&mut reward` is a valid, aligned, live `c_int` for the call.
         self.checked(|handle| unsafe {
@@ -487,6 +519,7 @@ impl Ale {
     /// Gymnasium's `AtariEnv.step` passes `false` here and reads
     /// [`Self::game_truncated`] separately.
     pub fn game_over(&mut self, with_truncation: bool) -> Result<bool, AleError> {
+        self.require_rom()?;
         self.flag(|handle, out| {
             // SAFETY: as `act`.
             unsafe { ffi::ale_shim_game_over(handle, c_int::from(with_truncation), out) }
@@ -498,24 +531,28 @@ impl Ale {
     /// Always `false` unless that setting was set: it is Gymnasium's
     /// registration, not ALE itself, that supplies the 108,000-frame cap.
     pub fn game_truncated(&mut self) -> Result<bool, AleError> {
+        self.require_rom()?;
         // SAFETY: as `act`.
         self.flag(|handle, out| unsafe { ffi::ale_shim_game_truncated(handle, out) })
     }
 
     /// Remaining lives, as ALE's game rules report them.
     pub fn lives(&mut self) -> Result<i32, AleError> {
+        self.require_rom()?;
         // SAFETY: as `act`.
         self.scalar(|handle, out| unsafe { ffi::ale_shim_lives(handle, out) })
     }
 
     /// Frames emulated since the ROM was loaded.
     pub fn frame_number(&mut self) -> Result<i32, AleError> {
+        self.require_rom()?;
         // SAFETY: as `act`.
         self.scalar(|handle, out| unsafe { ffi::ale_shim_frame_number(handle, out) })
     }
 
     /// Frames emulated since the current episode began.
     pub fn episode_frame_number(&mut self) -> Result<i32, AleError> {
+        self.require_rom()?;
         // SAFETY: as `act`.
         self.scalar(|handle, out| unsafe { ffi::ale_shim_episode_frame_number(handle, out) })
     }
@@ -526,6 +563,7 @@ impl Ale {
     /// maps to an ALE action value by indexing it — which is exactly what
     /// Gymnasium's `AtariEnv.step` does with `self._action_set[action]`.
     pub fn minimal_action_set(&mut self) -> Result<Vec<i32>, AleError> {
+        self.require_rom()?;
         let mut len = 0usize;
         // SAFETY: a null `out` with capacity 0 is the documented size query.
         self.checked(|handle| unsafe {
@@ -548,6 +586,7 @@ impl Ale {
     /// `height * width`. This is the same buffer `ale.getScreen()` exposes to
     /// Python.
     pub fn screen(&mut self) -> Result<Screen<'_>, AleError> {
+        self.require_rom()?;
         #[cfg(ale_linked)]
         {
             let mut height = 0usize;
@@ -585,6 +624,7 @@ impl Ale {
     /// further transform. The buffer belongs to this instance and is reused, so
     /// only the first call allocates.
     pub fn screen_grayscale(&mut self) -> Result<&[u8], AleError> {
+        self.require_rom()?;
         #[cfg(ale_linked)]
         {
             let mut len = 0usize;
@@ -702,6 +742,30 @@ mod tests {
         let error = ale.load_rom(&path).unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(matches!(error, AleError::Ale(_)), "unexpected: {error:?}");
+    }
+
+    /// Until `loadROM` runs, `ALEInterface::environment` is a null
+    /// `unique_ptr`, and every one of these methods dereferences it — a
+    /// segfault, not an exception. As with the `std::exit` tests, the point is
+    /// that the test binary is still alive to make an assertion.
+    #[test]
+    fn pre_rom_calls_are_errors_not_segfaults() {
+        let Ok(mut ale) = Ale::new() else {
+            return;
+        };
+        assert_eq!(ale.reset_game().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.act(0, 1.0).unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.game_over(false).unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.game_truncated().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.lives().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.frame_number().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(
+            ale.episode_frame_number().unwrap_err(),
+            AleError::NoRomLoaded
+        );
+        assert_eq!(ale.minimal_action_set().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.screen().unwrap_err(), AleError::NoRomLoaded);
+        assert_eq!(ale.screen_grayscale().unwrap_err(), AleError::NoRomLoaded);
     }
 
     /// `ALEState::apply_action`'s `default:` arm is `std::exit(-1)`; 18 is the

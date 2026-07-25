@@ -23,7 +23,6 @@ let reward = ale.act(actions[0], 1.0)?;
 let terminated = ale.game_over(false)?;
 let truncated = ale.game_truncated()?;
 let screen = ale.screen()?; // borrowed, 210 * 160 palette indices
-# Ok::<(), ale_rs::AleError>(())
 ```
 
 ## Building
@@ -52,7 +51,7 @@ dependencies at all.
 
 No ROMs are distributed here. `load_rom` takes a path; supply your own.
 
-## Two `std::exit` calls this crate exists to stand in front of
+## Three unrecoverable ALE paths this crate stands in front of
 
 ALE does not always signal failure recoverably, and a library that let those
 through would take a caller's whole process down:
@@ -66,6 +65,11 @@ through would take a caller's whole process down:
   any value outside `0..=17` (the `PLAYER_A_*` range) before the call. Values
   inside that range but illegal for the loaded ROM are folded to NOOP by ALE
   itself, exactly as under `ale-py`.
+- Until `loadROM` runs, `ALEInterface` holds its `environment` as a null
+  `unique_ptr`, and every post-ROM method (`act`, `reset_game`, `getScreen`,
+  …) dereferences it unconditionally — a segfault, which no exception guard
+  can catch. The wrapper tracks whether a ROM has loaded and returns
+  `AleError::NoRomLoaded` instead.
 
 One branch remains uncovered: a cartridge whose MD5 *is* known but whose console
 Stella then fails to create still exits.
