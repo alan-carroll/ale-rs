@@ -28,8 +28,7 @@ use std::ffi::CStr;
 use std::ffi::{CString, c_char, c_float, c_int, c_void};
 use std::fmt;
 use std::path::Path;
-use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Declarations of the C shim.
 ///
@@ -200,10 +199,12 @@ pub fn linked_version() -> Option<&'static str> {
     }
 }
 
-/// Set once by [`set_logger_mode`] so [`Ale::new`]'s default-quiet behaviour
-/// never overrides an explicit caller choice.
-static LOGGER_MODE_CHOSEN: AtomicBool = AtomicBool::new(false);
-static LOGGER_DEFAULT: Once = Once::new();
+/// Whether anything has set ALE's process-global logger mode — a caller via
+/// [`set_logger_mode`], or [`Ale::new`]'s default-quiet. `apply_logger_mode`
+/// runs only while this lock is held, which is the point of it being a mutex
+/// rather than an atomic: the default applies only from the untouched state
+/// and cannot land *after* a concurrent explicit choice and clobber it.
+static LOGGER_MODE_SET: Mutex<bool> = Mutex::new(false);
 
 /// Process-wide log verbosity for ALE's C++ logger.
 ///
@@ -214,7 +215,8 @@ static LOGGER_DEFAULT: Once = Once::new();
 /// Calling this at all — with any mode — also opts out of the default described
 /// on [`Ale::new`].
 pub fn set_logger_mode(mode: LoggerMode) {
-    LOGGER_MODE_CHOSEN.store(true, Ordering::Release);
+    let mut set = LOGGER_MODE_SET.lock().unwrap();
+    *set = true;
     apply_logger_mode(mode);
 }
 
@@ -357,15 +359,20 @@ impl Ale {
     /// Returns [`AleError::NotLinked`] when this build has no ALE linked, which
     /// is the case callers should skip on rather than fail.
     ///
-    /// **Side effect:** unless [`set_logger_mode`] was called first, the first
+    /// **Side effect:** unless [`set_logger_mode`] was called, the first
     /// construction in a process quiets ALE's logger to
     /// [`LoggerMode::Error`]. `ALEInterface`'s constructor writes a two-line
     /// banner at `Info` (`ale_interface.cpp:100`), so without this every worker
-    /// thread would print one into the caller's stdout. It runs under a
-    /// [`Once`], so concurrent constructions do not race on the global.
+    /// thread would print one into the caller's stdout. The default is applied
+    /// under the same lock [`set_logger_mode`] takes, so it cannot clobber an
+    /// explicit choice made concurrently.
     pub fn new() -> Result<Self, AleError> {
-        if !LOGGER_MODE_CHOSEN.load(Ordering::Acquire) {
-            LOGGER_DEFAULT.call_once(|| apply_logger_mode(LoggerMode::Error));
+        {
+            let mut set = LOGGER_MODE_SET.lock().unwrap();
+            if !*set {
+                apply_logger_mode(LoggerMode::Error);
+                *set = true;
+            }
         }
         #[cfg(ale_linked)]
         {
@@ -742,6 +749,42 @@ mod tests {
         let error = ale.load_rom(&path).unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(matches!(error, AleError::Ale(_)), "unexpected: {error:?}");
+    }
+
+    /// End-to-end smoke over a real cartridge, gated on `ALE_TEST_ROM` so no
+    /// ROM enters this repository (skips when unset, like the linkage gate).
+    /// The upstream source checkout ships `tests/resources/tetris.bin`, which
+    /// is 2600 homebrew present in ALE's MD5 table and works here.
+    #[test]
+    fn a_supplied_rom_loads_steps_and_yields_consistent_screens() {
+        let Ok(mut ale) = Ale::new() else {
+            return;
+        };
+        let Some(rom) = std::env::var_os("ALE_TEST_ROM") else {
+            return;
+        };
+        let rom = std::path::PathBuf::from(rom);
+        ale.set_int("random_seed", 42).unwrap();
+        let name = ale.supported_rom(&rom).unwrap();
+        assert!(!name.is_empty(), "canonical ROM name should be non-empty");
+        ale.load_rom(&rom).unwrap();
+        ale.reset_game().unwrap();
+        let actions = ale.minimal_action_set().unwrap();
+        assert!(
+            !actions.is_empty(),
+            "minimal action set should be non-empty"
+        );
+        ale.act(actions[0], 1.0).unwrap();
+        let (height, width, pixel_count) = {
+            let screen = ale.screen().unwrap();
+            assert_eq!(screen.pixels.len(), screen.height * screen.width);
+            (screen.height, screen.width, screen.pixels.len())
+        };
+        assert!(height > 0 && width > 0);
+        assert_eq!(ale.screen_grayscale().unwrap().len(), pixel_count);
+        ale.lives().unwrap();
+        assert!(!ale.game_truncated().unwrap(), "no frame cap was set");
+        assert!(ale.frame_number().unwrap() > 0, "acting emulated a frame");
     }
 
     /// Until `loadROM` runs, `ALEInterface::environment` is a null

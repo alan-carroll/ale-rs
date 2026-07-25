@@ -51,6 +51,15 @@ dependencies at all.
 
 No ROMs are distributed here. `load_rom` takes a path; supply your own.
 
+The test suite's happy-path smoke is gated the same way: it runs only when
+`ALE_TEST_ROM` points at a supported cartridge, and skips otherwise. The
+upstream source checkout ships `tests/resources/tetris.bin` — 2600 homebrew
+present in ALE's MD5 table — which works:
+
+```bash
+ALE_TEST_ROM="$PWD/Arcade-Learning-Environment/tests/resources/tetris.bin" cargo test
+```
+
 ## Three unrecoverable ALE paths this crate stands in front of
 
 ALE does not always signal failure recoverably, and a library that let those
