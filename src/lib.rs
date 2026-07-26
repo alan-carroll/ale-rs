@@ -685,8 +685,11 @@ impl Ale {
     ///
     /// These are the exact bytes Gymnasium's `AtariEnv._get_obs` returns for
     /// that observation type — it calls `getScreenGrayscale` and applies no
-    /// further transform. The buffer belongs to this instance and is reused, so
-    /// only the first call allocates.
+    /// further transform. The shim applies the palette itself from a snapshot
+    /// of ALE's own table — NEON lookups on aarch64, a plain loop elsewhere —
+    /// byte-identical to ALE's conversion and faster on both paths (see
+    /// `csrc/ale_shim.cpp`). The buffer belongs to this instance and is
+    /// reused, so only the first call allocates.
     pub fn screen_grayscale(&mut self) -> Result<&[u8], AleError> {
         self.require_rom()?;
         #[cfg(ale_linked)]
@@ -715,10 +718,12 @@ impl Ale {
     /// Three bytes per pixel, row-major, so the slice is `3 * height * width`
     /// long. These are the exact bytes `ale_py`'s `AtariEnv.render()` returns in
     /// `rgb_array` mode — `env.py` calls `getScreenRGB` and applies no further
-    /// transform. As with [`Self::screen_grayscale`] the buffer belongs to this
-    /// instance and is reused, so only the first call allocates; it is a
-    /// *separate* buffer from the grayscale one, so the two do not invalidate
-    /// each other.
+    /// transform — and the shim's fast paths reproduce ALE's conversion
+    /// byte-for-byte (see [`Self::screen_grayscale`]). As with
+    /// [`Self::screen_grayscale`] the
+    /// buffer belongs to this instance and is reused, so only the first call
+    /// allocates; it is a *separate* buffer from the grayscale one, so the two
+    /// do not invalidate each other.
     pub fn screen_rgb(&mut self) -> Result<&[u8], AleError> {
         self.require_rom()?;
         #[cfg(ale_linked)]
@@ -895,6 +900,72 @@ mod tests {
         ale.lives().unwrap();
         assert!(!ale.game_truncated().unwrap(), "no frame cap was set");
         assert!(ale.frame_number().unwrap() > 0, "acting emulated a frame");
+    }
+
+    /// The shim's aarch64 fast path converts screens through a palette
+    /// snapshot rebuilt after every `load_rom` (csrc/ale_shim.cpp) rather
+    /// than ALE's own per-pixel loops. Two properties pin it to those loops.
+    /// The conversions must be *pointwise*: one raw palette index mapping to
+    /// two different outputs anywhere in an episode means the table diverged
+    /// from the palette ALE is actually using. And an instance that has
+    /// loaded ROMs before must convert exactly like a fresh one: a snapshot
+    /// surviving `load_rom` — the one call that can swap the palette — would
+    /// pass every single-load test and still be wrong, so this is the
+    /// regression a stale-invalidation bug would trip.
+    #[test]
+    fn screen_conversions_are_pointwise_and_survive_reloading() {
+        let Ok(mut ale) = Ale::new() else {
+            return;
+        };
+        let Some(rom) = std::env::var_os("ALE_TEST_ROM") else {
+            return;
+        };
+        let rom = std::path::PathBuf::from(rom);
+
+        /// Per-frame (raw, grayscale, rgb) triples for one deterministic run.
+        type Frames = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+        let run = |ale: &mut Ale| -> Frames {
+            ale.set_int("random_seed", 7).unwrap();
+            ale.set_float("repeat_action_probability", 0.0).unwrap();
+            ale.load_rom(&rom).unwrap();
+            ale.reset_game().unwrap();
+            let actions = ale.minimal_action_set().unwrap();
+            let mut raws = Vec::new();
+            let mut grays = Vec::new();
+            let mut rgbs = Vec::new();
+            for step in 0..120 {
+                ale.act(actions[step % actions.len()], 1.0).unwrap();
+                raws.push(ale.screen().unwrap().pixels.to_vec());
+                grays.push(ale.screen_grayscale().unwrap().to_vec());
+                rgbs.push(ale.screen_rgb().unwrap().to_vec());
+            }
+            (raws, grays, rgbs)
+        };
+
+        // Second load on the same instance: the palette snapshot from the
+        // first load must not survive into it.
+        let _ = run(&mut ale);
+        let reloaded = run(&mut ale);
+        let fresh = run(&mut Ale::new().unwrap());
+        assert_eq!(
+            reloaded, fresh,
+            "a reloaded instance diverged from a fresh one"
+        );
+
+        // Pointwise: accumulate the observed index -> output mappings across
+        // every frame and demand they never contradict.
+        let (raws, grays, rgbs) = fresh;
+        let mut gray_map: [Option<u8>; 256] = [None; 256];
+        let mut rgb_map: [Option<[u8; 3]>; 256] = [None; 256];
+        for ((raw, gray), rgb) in raws.iter().zip(&grays).zip(&rgbs) {
+            for (i, &index) in raw.iter().enumerate() {
+                let index = index as usize;
+                let g = gray[i];
+                let c = [rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]];
+                assert_eq!(*gray_map[index].get_or_insert(g), g, "index {index}");
+                assert_eq!(*rgb_map[index].get_or_insert(c), c, "index {index}");
+            }
+        }
     }
 
     /// Until `loadROM` runs, `ALEInterface::environment` is a null

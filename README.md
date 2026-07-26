@@ -91,6 +91,46 @@ through would take a caller's whole process down:
 One branch remains uncovered: a cartridge whose MD5 *is* known but whose console
 Stella then fails to create still exits.
 
+## Performance
+
+Numbers below are from one machine (Apple M4 Pro, ALE v0.12 built `-O3`
+Release, Ms. Pac-Man unless noted) — treat them as shape, not gospel.
+
+Where a frame's time goes: ~97% of `act()` is inside `libale.a` itself —
+`TIA::updateFrame` (~58%) and the 6502 core (~31%) under a sampling profiler —
+and the shim plus FFI boundary cost nanoseconds. So the levers, largest first:
+
+- **`act()`** runs 36–59 µs/frame depending on the game (17–28k frames/s for a
+  single instance).
+- **Instances scale near-linearly across performance cores** (see Threading):
+  one instance ~20k frames/s stepping with a grayscale observation, ~136k
+  aggregate on 8 threads, ~158k on 12 (8P+4E cores). No shared state, no
+  contention.
+- **`screen()` is free** — a borrowed pointer into the emulator's buffer.
+- **`screen_grayscale()` / `screen_rgb()` bypass ALE's conversion loops**
+  (`csrc/ale_shim.cpp`), which decompose a 32-bit palette entry with shifts
+  for every pixel. The shim snapshots the palette into byte tables after each
+  ROM load and applies those instead: NEON `tbl` kernels on aarch64 (~2.3 µs
+  and ~7.2 µs per frame versus ~11.5 and ~19.1 through ALE's loops, making a
+  step-plus-observe loop ~23-26% faster end to end), and plain lookup loops
+  everywhere else (byte-to-byte walk for grayscale, one four-byte overlapping
+  store per pixel for RGB — measured ~1.9x and ~2.8x under Rosetta
+  translation, so treat those as directional).
+  Output is byte-identical on both paths — verified against ALE's loops over
+  thousands of deterministic frames across five ROMs (the x86 path under
+  Rosetta), and
+  the `screen_conversions_are_pointwise_and_survive_reloading` test guards
+  the invalidation seam on whatever machine runs the suite. An AVX2 kernel
+  would roughly double the x86 conversion rate (nibble-split `pshufb`); deliberately not shipped until it can be validated on x86 hardware.
+- **How `libale.a` is compiled matters only at the margins.** `-mcpu=native`
+  and ThinLTO both measured within noise. Profile-guided optimization was the
+  one real compiler lever: +2–16% on `act()` depending on the game. Build with
+  `-DCMAKE_CXX_FLAGS="-fprofile-generate=$PWD/pgo"`, run a representative
+  workload (linking from Rust needs
+  `RUSTFLAGS="-C link-arg=-fprofile-generate=$PWD/pgo"` so the profile runtime
+  links), merge with `llvm-profdata merge -output=ale.profdata pgo/*.profraw`,
+  then rebuild with `-DCMAKE_CXX_FLAGS="-fprofile-use=$PWD/ale.profdata"`.
+
 ## Threading
 
 `Ale` is `Send` but not `Sync` and not `Clone`. The `unsafe impl Send` is

@@ -88,14 +88,20 @@ const uint8_t *ale_shim_screen(AleShim *shim, size_t *out_height,
 /* Applies the grayscale palette into a buffer owned by this handle and returns
  * a borrowed pointer to it. Valid until the next call to this function on the
  * same handle. NULL on failure. The buffer is reused across calls, so steady
- * state allocates nothing. */
+ * state allocates nothing.
+ *
+ * The conversion runs over a palette snapshot taken from ALE's own conversion
+ * loops (see ale_shim.cpp) — NEON table lookups on aarch64, a plain lookup
+ * loop elsewhere. Both produce bytes identical to what
+ * ALEInterface::getScreenGrayscale produces. */
 const uint8_t *ale_shim_screen_grayscale(AleShim *shim, size_t *out_len);
 
 /* As ale_shim_screen_grayscale, but the RGB palette: three bytes per pixel,
- * row-major, so out_len is 3 * height * width. This is the exact buffer
+ * row-major, so out_len is 3 * height * width. These are the exact bytes
  * ale_py's render() returns in rgb_array mode (env.py calls getScreenRGB and
- * applies no further transform). Its own reused handle-owned buffer, so it does
- * not disturb the grayscale one. */
+ * applies no further transform); both fast paths preserve that byte-for-byte,
+ * as above. Its own reused handle-owned buffer, so it does not disturb the
+ * grayscale one. */
 const uint8_t *ale_shim_screen_rgb(AleShim *shim, size_t *out_len);
 
 /* Compiled-in ALE_VERSION of the linked library. */
